@@ -1,0 +1,10 @@
+# nix-direnv cache (contains local paths)
+.direnv/
+
+# Cursor source files (third-party assets)
+Cursors/*.ani
+Cursors/*.inf
+
+# make-cursor.sh output directories
+# Add theme names as needed, e.g.:
+# CursorTheme/
