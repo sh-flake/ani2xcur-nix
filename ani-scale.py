@@ -234,45 +234,209 @@ def ico_frame_to_rgba(ico_data):
 
 # ─── 고품질 리사이즈 ─────────────────────────────────────────────────────────
 
+def _lanczos_kernel(x, a=3):
+    """Lanczos-a 커널 함수."""
+    x = np.abs(x)
+    result = np.zeros_like(x)
+    # x == 0
+    mask_zero = x < 1e-8
+    result[mask_zero] = 1.0
+    # 0 < x < a
+    mask_mid = (~mask_zero) & (x < a)
+    xm = x[mask_mid]
+    result[mask_mid] = (a * np.sin(np.pi * xm) * np.sin(np.pi * xm / a)
+                        / (np.pi**2 * xm**2))
+    return result
+
+
+def _resample_1d(data, src_len, dst_len, axis, a=3):
+    """
+    1D Lanczos 리샘플링 (float64 배열 위에서 직접 수행).
+    data: (..., src_len, ...) shaped float64 array
+    axis: 리샘플링할 축
+    """
+    if src_len == dst_len:
+        return data.copy()
+
+    scale = dst_len / src_len
+    # 다운스케일 시 필터 폭 확장
+    if scale < 1.0:
+        filter_scale = 1.0 / scale
+        inv_filter_scale = scale
+    else:
+        filter_scale = 1.0
+        inv_filter_scale = 1.0
+
+    support = a * filter_scale
+
+    # 출력 배열 shape 계산
+    out_shape = list(data.shape)
+    out_shape[axis] = dst_len
+    out = np.zeros(out_shape, dtype=np.float64)
+
+    for i in range(dst_len):
+        # 소스 좌표 (중심)
+        center = (i + 0.5) / scale - 0.5
+        left = int(np.floor(center - support))
+        right = int(np.ceil(center + support))
+        left = max(left, 0)
+        right = min(right, src_len - 1)
+
+        indices = np.arange(left, right + 1)
+        weights = _lanczos_kernel((indices - center) * inv_filter_scale, a)
+
+        # 가중치 정규화
+        wsum = weights.sum()
+        if wsum > 0:
+            weights /= wsum
+
+        # 가중 합산 — axis에 따라 슬라이싱
+        # 축에 맞는 인덱싱을 위해 np.take + 가중치 브로드캐스트 사용
+        sliced = np.take(data, indices, axis=axis)  # (..., len(indices), ...)
+
+        # weights를 sliced와 같은 ndim으로 reshape
+        w_shape = [1] * data.ndim
+        w_shape[axis] = len(weights)
+        w = weights.reshape(w_shape)
+
+        summed = (sliced * w).sum(axis=axis)
+
+        # 결과를 out에 삽입
+        idx = [slice(None)] * data.ndim
+        idx[axis] = i
+        out[tuple(idx)] = summed
+
+    return out
+
+
+def _extend_edge_colors(rgba):
+    """
+    투명 픽셀의 RGB를 인접 불투명 픽셀의 색으로 채우는 전처리.
+    (Edge color extension / color bleeding)
+
+    픽셀아트에서 투명 영역의 RGB는 보통 (0,0,0)인데,
+    Lanczos 보간 시 이 검은색이 가장자리에 섞여 들어가
+    연한 회색 유령 윤곽을 만든다.
+
+    불투명 픽셀의 색을 투명 영역으로 확산시키면,
+    보간 시 섞이는 색이 인접 색과 동일해져 유령 윤곽이 사라진다.
+
+    다중 패스로 확산하여 Lanczos 커널 반경만큼 충분히 채운다.
+    """
+    h, w = rgba.shape[:2]
+    result = rgba.copy()
+    alpha = result[:, :, 3]
+
+    # 8방향 오프셋
+    offsets = [(-1, -1), (-1, 0), (-1, 1),
+               (0, -1),          (0, 1),
+               (1, -1),  (1, 0), (1, 1)]
+
+    # 여러 패스로 색상 확산 (Lanczos-3 커널 반경=3이므로 최소 3패스)
+    for _ in range(4):
+        transparent = alpha == 0
+        if not np.any(transparent):
+            break
+
+        new_rgb = result[:, :, :3].copy()
+        filled = np.zeros((h, w), dtype=bool)
+
+        for dy, dx in offsets:
+            # 이웃 좌표
+            sy = np.clip(np.arange(h) + dy, 0, h - 1)
+            sx = np.clip(np.arange(w) + dx, 0, w - 1)
+            neighbor_alpha = alpha[np.ix_(sy, sx)]
+            neighbor_rgb = result[np.ix_(sy, sx, [0, 1, 2])]
+
+            # 현재 투명 + 이웃 불투명 → 이웃 색 복사
+            can_fill = transparent & (neighbor_alpha > 0) & (~filled)
+            for c in range(3):
+                nc = neighbor_rgb[:, :, c]
+                new_rgb[:, :, c] = np.where(can_fill, nc, new_rgb[:, :, c])
+            filled |= can_fill
+
+        result[:, :, :3] = new_rgb
+        # 채워진 픽셀을 "색상은 있지만 alpha=0"으로 유지
+        # 다음 패스를 위해 alpha 기준을 갱신: 색이 채워진 곳도 소스로 사용
+        alpha = np.where(filled, 1, alpha)  # 확산 소스로 인식 (실제 alpha는 변경 안 함)
+
+    # 알파는 원본 유지 (색상만 확산)
+    result[:, :, 3] = rgba[:, :, 3]
+    return result
+
+
+def _cleanup_alpha(result, alpha_low=8, alpha_high=248):
+    """
+    리사이즈 후 알파 채널 정리.
+
+    픽셀아트 커서는 원본이 binary alpha (0 or 255)이므로,
+    리사이즈로 생긴 극단적 반투명 값을 정리한다:
+    - alpha < alpha_low → 0 (유령 픽셀 제거)
+    - alpha > alpha_high → 255 (거의 불투명한 픽셀 확정)
+    - 중간값은 유지 (자연스러운 안티앨리어싱 가장자리)
+    """
+    cleaned = result.copy()
+    a = cleaned[:, :, 3].astype(np.float64)
+
+    # 낮은 alpha 제거 (유령 윤곽 원인)
+    mask_low = a < alpha_low
+    cleaned[mask_low] = [0, 0, 0, 0]
+
+    # 높은 alpha 확정
+    mask_high = a > alpha_high
+    cleaned[:, :, 3] = np.where(mask_high, 255, cleaned[:, :, 3])
+
+    return cleaned
+
+
 def resize_rgba(rgba, dst):
     """
     RGBA 이미지를 dst×dst 크기로 고품질 리사이즈.
     업스케일링과 다운스케일링 모두 지원.
 
-    전략:
-    1. Premultiplied alpha로 변환 (가장자리 어두운 프린징 방지)
-    2. Premultiplied RGB를 Lanczos로 리사이즈
-    3. 알파 채널을 Lanczos로 리사이즈 (부드러운 안티앨리어싱 가장자리)
-    4. Un-premultiply하여 최종 RGBA 생성
+    픽셀아트 커서에 최적화된 전략 (전 과정 float64 유지):
+    1. Edge color extension — 투명 영역 RGB를 인접 색으로 채움
+    2. Premultiplied alpha + Lanczos 리사이즈
+    3. Un-premultiply
+    4. Alpha cleanup — 유령 반투명 픽셀 제거 + 거의 불투명 확정
     """
     h, w = rgba.shape[:2]
 
-    rgb = rgba[:, :, :3].astype(np.float64)
-    alpha = rgba[:, :, 3].astype(np.float64) / 255.0
+    # ① 가장자리 색상 확장 (유령 윤곽 방지의 핵심)
+    extended = _extend_edge_colors(rgba)
 
-    # 프리멀티플라이
-    premul = np.zeros_like(rgb)
-    for c in range(3):
-        premul[:, :, c] = rgb[:, :, c] * alpha
+    # ② float64로 변환 (0~255 범위 유지)
+    img_f = extended.astype(np.float64)
+    rgb = img_f[:, :, :3]
+    alpha = img_f[:, :, 3:4] / 255.0  # (H, W, 1), 0~1 범위
 
-    # Premultiplied RGB를 Lanczos로 리사이즈
-    premul_img = Image.fromarray(premul.astype(np.uint8), 'RGB')
-    premul_up = np.array(premul_img.resize((dst, dst), Image.LANCZOS)).astype(np.float64)
+    # Premultiply: RGB * alpha
+    premul = rgb * alpha
 
-    # 알파 채널을 Lanczos로 리사이즈
-    alpha_img = Image.fromarray((alpha * 255).astype(np.uint8), 'L')
-    alpha_up = np.array(alpha_img.resize((dst, dst), Image.LANCZOS)).astype(np.float64) / 255.0
+    # 4채널로 합치기: [premul_R, premul_G, premul_B, alpha_0_255]
+    combined = np.concatenate([premul, img_f[:, :, 3:4]], axis=2)
 
-    # 언프리멀티플라이
+    # ③ 2-pass separable Lanczos 리샘플링 (float64 상태 유지)
+    temp = _resample_1d(combined, w, dst, axis=1)
+    resized = _resample_1d(temp, h, dst, axis=0)
+
+    # ④ Un-premultiply
     result = np.zeros((dst, dst, 4), dtype=np.uint8)
-    safe_alpha = np.where(alpha_up > 1.0 / 255.0, alpha_up, 1.0)  # 0 나누기 방지
-    for c in range(3):
-        unpremul = premul_up[:, :, c] / safe_alpha
-        # 알파가 사실상 0이면 색상은 무의미
-        unpremul = np.where(alpha_up > 1.0 / 255.0, unpremul, 0)
-        result[:, :, c] = np.clip(unpremul, 0, 255).astype(np.uint8)
 
-    result[:, :, 3] = np.clip(alpha_up * 255, 0, 255).astype(np.uint8)
+    res_alpha = resized[:, :, 3]
+    alpha_norm = res_alpha / 255.0
+
+    safe_alpha = np.where(alpha_norm > 1.0 / 255.0, alpha_norm, 1.0)
+
+    for c in range(3):
+        unpremul = resized[:, :, c] / safe_alpha
+        unpremul = np.where(alpha_norm > 1.0 / 255.0, unpremul, 0.0)
+        result[:, :, c] = np.clip(np.round(unpremul), 0, 255).astype(np.uint8)
+
+    result[:, :, 3] = np.clip(np.round(res_alpha), 0, 255).astype(np.uint8)
+
+    # ⑤ Alpha cleanup (유령 픽셀 제거)
+    result = _cleanup_alpha(result)
 
     return result
 
