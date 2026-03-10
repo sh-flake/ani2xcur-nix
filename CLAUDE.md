@@ -21,6 +21,9 @@ Note: `win2xcur` (`pip install win2xcur`) is not provided by the devShell — in
 # Full pipeline: resize ANI files → convert INF → win2xcurtheme → index.theme → Nix overlay
 ./make-cursor.sh <ThemeName> [lanczos|nearest]   # default: lanczos
 
+# No-resize pipeline: convert without scaling (keeps original size)
+./make-cursor-default-size.sh <ThemeName>
+
 # Individual tools
 python ani-scale-lanczos.py input.ani -o output.ani -s 32 -t 48
 python ani-scale-nearest.py input.ani -o output.ani -s 32 -t 48
@@ -31,7 +34,7 @@ There are no tests or linting configured.
 
 ## Architecture
 
-Five-stage pipeline orchestrated by `make-cursor.sh`:
+Five-stage pipeline orchestrated by `make-cursor.sh` (with resize) or `make-cursor-default-size.sh` (no resize):
 
 1. **ani-scale-lanczos.py** / **ani-scale-nearest.py** — Resizes ANI cursor frames (e.g. 32→48px). Lanczos uses premultiplied alpha + Lanczos filtering (smooth edges, may leave minor ghost pixels). Nearest uses nearest-neighbor mapping (no ghost pixels, slight stairstepping). Both parse/rebuild RIFF/ANI binary format, handle multiple color depths (1/4/8/24/32 bpp), and preserve hotspot coordinates.
 2. **inf-convert.py** — Normalizes Windows `install.inf` files for `win2xcurtheme` compatibility (strips `[Wreg]`, standardizes rundll32 calls, fixes quoting/spacing, adds missing HKLM entries).
