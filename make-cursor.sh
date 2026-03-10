@@ -4,22 +4,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <ThemeName>"
-    echo "Example: $0 Klukai"
+    echo "Usage: $0 <ThemeName> [lanczos|nearest]"
+    echo "Example: $0 Klukai nearest"
     exit 1
 fi
 
 THEME_NAME="$1"
+SCALE_METHOD="${2:-lanczos}"
+
+if [ "$SCALE_METHOD" != "lanczos" ] && [ "$SCALE_METHOD" != "nearest" ]; then
+    echo "Error: Unknown scale method '$SCALE_METHOD'. Use 'lanczos' or 'nearest'."
+    exit 1
+fi
 THEME_LOWER="$(echo "$THEME_NAME" | tr '[:upper:]' '[:lower:]')"
 CURSORS_DIR="$SCRIPT_DIR/Cursors"
 OUTPUT_DIR="$SCRIPT_DIR/$THEME_NAME"
 
-echo "=== Making cursor theme: $THEME_NAME ==="
+echo "=== Making cursor theme: $THEME_NAME (scale: $SCALE_METHOD) ==="
 
 # 1. ANI 파일 크기 변경
 echo "[1/6] Resizing ANI files..."
 mkdir -p "$OUTPUT_DIR"
-python "$SCRIPT_DIR/ani-scale.py" "$CURSORS_DIR"/*.ani -o "$OUTPUT_DIR" -s 32 -t 48
+python "$SCRIPT_DIR/ani-scale-${SCALE_METHOD}.py" "$CURSORS_DIR"/*.ani -o "$OUTPUT_DIR" -s 32 -t 48
 
 # 2. install.inf 포맷 변환
 echo "[2/6] Converting install.inf..."

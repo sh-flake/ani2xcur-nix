@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-ANI 커서 리사이저
-알파 채널을 올바르게 처리하는 고품질 리사이즈.
+ANI 커서 리사이저 (Nearest Neighbor)
+보간 없이 원본 픽셀을 그대로 매핑하는 리사이즈.
 업스케일링(예: 32→48)과 다운스케일링(예: 128→48) 모두 지원.
 
-Premultiplied alpha + Lanczos 리샘플링으로 부드러운 가장자리를 유지하고,
-32bpp ARGB 커서 프레임으로 출력하여 안티앨리어싱된 투명도를 보존.
+반투명 유령 픽셀이 생기지 않고 선명한 가장자리를 유지하지만,
+비정수 배율에서 약간의 불균일/계단 현상이 나타날 수 있음.
 
 Usage:
-    python ani-scale.py input.ani -o output.ani                    # 소스 크기 자동 감지, 대상=48
-    python ani-scale.py input.ani -o output.ani -s 128 -t 48      # 크기 직접 지정
-    python ani-scale.py *.ani -o output_dir/ -s 32 -t 48          # 배치 처리
+    python ani-scale-nearest.py input.ani -o output.ani                    # 소스 크기 자동 감지, 대상=48
+    python ani-scale-nearest.py input.ani -o output.ani -s 128 -t 48      # 크기 직접 지정
+    python ani-scale-nearest.py *.ani -o output_dir/ -s 32 -t 48          # 배치 처리
 """
 
 import struct
@@ -391,52 +391,20 @@ def _cleanup_alpha(result, alpha_low=8, alpha_high=248):
 
 def resize_rgba(rgba, dst):
     """
-    RGBA 이미지를 dst×dst 크기로 고품질 리사이즈.
-    업스케일링과 다운스케일링 모두 지원.
-
-    픽셀아트 커서에 최적화된 전략 (전 과정 float64 유지):
-    1. Edge color extension — 투명 영역 RGB를 인접 색으로 채움
-    2. Premultiplied alpha + Lanczos 리사이즈
-    3. Un-premultiply
-    4. Alpha cleanup — 유령 반투명 픽셀 제거 + 거의 불투명 확정
+    RGBA 이미지를 dst×dst 크기로 Nearest Neighbor 리사이즈.
+    픽셀아트 커서에 최적: 보간 없이 원본 픽셀을 그대로 매핑하므로
+    반투명 유령 픽셀이 생기지 않고 선명한 가장자리를 유지.
     """
     h, w = rgba.shape[:2]
-
-    # ① 가장자리 색상 확장 (유령 윤곽 방지의 핵심)
-    extended = _extend_edge_colors(rgba)
-
-    # ② float64로 변환 (0~255 범위 유지)
-    img_f = extended.astype(np.float64)
-    rgb = img_f[:, :, :3]
-    alpha = img_f[:, :, 3:4] / 255.0  # (H, W, 1), 0~1 범위
-
-    # Premultiply: RGB * alpha
-    premul = rgb * alpha
-
-    # 4채널로 합치기: [premul_R, premul_G, premul_B, alpha_0_255]
-    combined = np.concatenate([premul, img_f[:, :, 3:4]], axis=2)
-
-    # ③ 2-pass separable Lanczos 리샘플링 (float64 상태 유지)
-    temp = _resample_1d(combined, w, dst, axis=1)
-    resized = _resample_1d(temp, h, dst, axis=0)
-
-    # ④ Un-premultiply
     result = np.zeros((dst, dst, 4), dtype=np.uint8)
 
-    res_alpha = resized[:, :, 3]
-    alpha_norm = res_alpha / 255.0
-
-    safe_alpha = np.where(alpha_norm > 1.0 / 255.0, alpha_norm, 1.0)
-
-    for c in range(3):
-        unpremul = resized[:, :, c] / safe_alpha
-        unpremul = np.where(alpha_norm > 1.0 / 255.0, unpremul, 0.0)
-        result[:, :, c] = np.clip(np.round(unpremul), 0, 255).astype(np.uint8)
-
-    result[:, :, 3] = np.clip(np.round(res_alpha), 0, 255).astype(np.uint8)
-
-    # ⑤ Alpha cleanup (유령 픽셀 제거)
-    result = _cleanup_alpha(result)
+    for y in range(dst):
+        src_y = int(y * h / dst)
+        src_y = min(src_y, h - 1)
+        for x in range(dst):
+            src_x = int(x * w / dst)
+            src_x = min(src_x, w - 1)
+            result[y, x] = rgba[src_y, src_x]
 
     return result
 
