@@ -365,7 +365,7 @@ def _extend_edge_colors(rgba):
     return result
 
 
-def _cleanup_alpha(result, alpha_low=50, alpha_high=248):
+def _cleanup_alpha(result, alpha_low=85, alpha_high=170):
     """
     리사이즈 후 알파 채널 정리.
 
